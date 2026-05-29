@@ -101,8 +101,35 @@ function stripQuotes(p) {
     return p.replace(/^['"]+|['"]+$/g, '');
 }
 
+// Class names passed to --fsdp_transformer_layer_cls_to_wrap are interpolated
+// into a shell command string. Restrict to valid Python identifiers (optionally
+// comma-separated) so a crafted value like "$(rm -rf ~)" can't inject commands.
+function sanitizeClassList(value) {
+    if (typeof value !== 'string') return '';
+    return value.split(',')
+        .map(s => s.trim())
+        .filter(s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s))
+        .join(',');
+}
+
 function getJobPath(name) {
     return path.join(JOBS_DIR, sanitizeName(name));
+}
+
+// Safely resolve a user-supplied relative path inside a trusted base directory.
+// Prevents path-traversal (e.g. "../../global_config.toml") from escaping the
+// job folder. Returns the absolute path if it stays within baseDir, else null.
+function safeJoin(baseDir, relativePath) {
+    if (typeof relativePath !== 'string') return null;
+    // Reject NUL bytes outright (can truncate paths in some syscalls).
+    if (relativePath.indexOf('\0') !== -1) return null;
+    const baseResolved = path.resolve(baseDir);
+    const target = path.resolve(baseResolved, relativePath);
+    // Containment check: target must be baseDir itself or sit below it.
+    const rel = path.relative(baseResolved, target);
+    if (rel === '' ) return target; // baseDir itself
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    return target;
 }
 
 function getGlobalConfig() {
@@ -998,7 +1025,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                     if (ta.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && ta.fsdp2_min_num_params)
                         accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp2_min_num_params}`;
                     if (ta.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                        const cls = (ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        const cls = sanitizeClassList((ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || ''));
                         if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
                     }
                 }
@@ -1018,7 +1045,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                 if (ta.fsdp_auto_wrap_policy) {
                     accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp_auto_wrap_policy}`;
                     if (ta.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                        const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        const cls = sanitizeClassList((ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || ''));
                         if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
                     }
                 }
@@ -1425,6 +1452,17 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 broadcastStatus(jobName, 'idle');
             });
 
+            // Without an 'error' listener an emitted 'error' (e.g. spawn ENOENT)
+            // would throw and crash the whole server. Handle it and release the FD.
+            oneShotProc.on('error', (err) => {
+                const msg = `\nERROR: ${err.message}\n`;
+                oneShotLogStream.write(msg);
+                oneShotLogStream.end();
+                broadcastLog(jobName, msg);
+                runningJobs.delete(jobName);
+                broadcastStatus(jobName, 'idle');
+            });
+
             runningJobs.set(jobName, {
                 process: oneShotProc,
                 pid: oneShotProc.pid,
@@ -1621,6 +1659,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 
         proc.on('error', (err) => {
             appendLog(Buffer.from(`\nERROR: ${err.message}\n`));
+            logStream.end(); // close the file descriptor even if 'close' never fires (e.g. spawn ENOENT)
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
         });
@@ -1764,7 +1803,10 @@ app.get('/api/jobs/:name/samples/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0]; // everything after /samples/
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
             res.sendFile(filePath);
         } else {
@@ -1809,7 +1851,10 @@ app.get('/api/jobs/:name/metadata/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0];
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
 
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
             const metadata = extractPngMetadata(filePath);
@@ -1827,7 +1872,10 @@ app.delete('/api/jobs/:name/samples/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0];
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
 
         if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
