@@ -21,6 +21,37 @@ from library import anima_models
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
 
 
+def _require_model_path(path: Optional[str], label: str, allow_dir: bool = False) -> None:
+    """Validate a user-supplied model path with an actionable error message.
+
+    Raises a clear error *before* any heavy loading is attempted, instead of
+    letting a downstream loader (safetensors/transformers) fail with a cryptic
+    message. This is the single choke point for all training scripts and the
+    inference script, since every model load goes through the loaders below.
+
+    Args:
+        path: The path to validate (file or, if allow_dir, a directory).
+        label: Human-readable name used in error messages (e.g. "Anima DiT model").
+        allow_dir: When True, a directory is accepted (used for the Qwen3 path).
+    """
+    if path is None or (isinstance(path, str) and path.strip() == ""):
+        raise ValueError(
+            f"{label} path is not set. Set it via the corresponding argument "
+            f"(e.g. --dit_path / --vae_path / --qwen3_path) or in the UI "
+            f"Global Settings, then retry."
+        )
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{label} not found at: {path}\n"
+            f"  Check that the path is correct and the file/directory exists. "
+            f"Absolute paths are recommended (e.g. C:\\models\\anima.safetensors)."
+        )
+    if not allow_dir and os.path.isdir(path):
+        raise IsADirectoryError(
+            f"{label} path points to a directory but a file was expected: {path}"
+        )
+
+
 def load_safetensors(path: str, device: str = "cpu", dtype: Optional[torch.dtype] = None) -> Dict[str, torch.Tensor]:
     """Load a safetensors file and optionally cast to dtype."""
     sd = load_file(path, device=device)
@@ -49,6 +80,10 @@ def load_anima_dit(
     """
     if transformer_dtype is None:
         transformer_dtype = dtype
+
+    _require_model_path(dit_path, "Anima DiT model")
+    if llm_adapter_path is not None:
+        _require_model_path(llm_adapter_path, "LLM adapter weights")
 
     logger.info(f"Loading Anima DiT from {dit_path}")
     if disable_mmap:
@@ -123,6 +158,8 @@ def load_anima_vae(vae_path: str, dtype: torch.dtype = torch.float32, device: st
     """
     from library.anima_models import ANIMA_VAE_MEAN, ANIMA_VAE_STD
 
+    _require_model_path(vae_path, "Anima VAE")
+
     logger.info(f"Loading Anima VAE from {vae_path}")
 
     # VAE config (fixed for WanVAE)
@@ -172,6 +209,8 @@ def load_qwen3_tokenizer(qwen3_path: str):
     """
     from transformers import AutoTokenizer
 
+    _require_model_path(qwen3_path, "Qwen3 text encoder", allow_dir=True)
+
     if os.path.isdir(qwen3_path):
         tokenizer = AutoTokenizer.from_pretrained(qwen3_path, local_files_only=True)
     else:
@@ -203,6 +242,8 @@ def load_qwen3_text_encoder(qwen3_path: str, dtype: torch.dtype = torch.bfloat16
     """
     import transformers
     from transformers import AutoTokenizer
+
+    _require_model_path(qwen3_path, "Qwen3 text encoder", allow_dir=True)
 
     logger.info(f"Loading Qwen3 text encoder from {qwen3_path}")
 
