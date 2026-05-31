@@ -1,21 +1,21 @@
 # Library Directory Audit Report
 
 ## Summary
-The "Safe to Delete" files were audited to ensure their removal effectively "feature-gates" the trainer to exclude optional/legacy methods without breaking the core **Anima** or **Standard LoRA (train_network.py)** training processes.
+This report classifies files in `library/` by whether they are still reachable
+from any entry-point script in the repo. It was **re-verified empirically** by
+scanning every `.py` file (excluding `venv/`) for inbound import references and
+following the dependency graph transitively — not by architecture name alone.
 
-**Recommendation:** Delete all files listed below to reduce clutter and potential confusion.
+> ⚠️ The previous version of this audit was inaccurate: it listed several files
+> as "safe to delete" that are in fact imported (e.g. `sd3_train_utils.py` is
+> imported by `anima_train_utils.py`, and the SDXL/Lumina/Flux helper files are
+> used by the SDXL and Lumina trainers). Always confirm with a reference scan
+> before deleting.
 
-## Safe to Delete (Confirmed Unused)
+## Removed (confirmed dead, deleted)
+These formed isolated dead subgraphs: nothing outside the group imported them.
 
-### 1. Stable Diffusion 3 (SD3)
-These files are specific to SD3 architecture and are not used by Anima or the generic SD1.5/2.1/SDXL trainer.
-- `library/strategy_sd3.py`
-- `library/sd3_models.py`
-- `library/sd3_train_utils.py`
-- `library/sd3_utils.py`
-
-### 2. Hunyuan
-These files are specific to Hunyuan Video/Image generation models.
+### Hunyuan (entire subgraph — self-contained, no external importers)
 - `library/strategy_hunyuan_image.py`
 - `library/hunyuan_image_models.py`
 - `library/hunyuan_image_modules.py`
@@ -23,38 +23,40 @@ These files are specific to Hunyuan Video/Image generation models.
 - `library/hunyuan_image_utils.py`
 - `library/hunyuan_image_vae.py`
 
-### 3. Lumina
-These files are specific to Lumina-Next-T2I models.
-- `library/strategy_lumina.py`
-- `library/lumina_models.py`
-- `library/lumina_train_util.py`
-- `library/lumina_util.py`
+### Unused strategy shims (no inbound references)
+- `library/strategy_sd3.py`  (note: `sd3_models.py`, `sd3_utils.py`, `sd3_train_utils.py` are **kept** — used by Anima/Lumina/Flux)
+- `library/strategy_flux.py` (note: `flux_models.py`, `flux_utils.py` are **kept** — referenced elsewhere)
 
-### 4. Flux (Standard)
-Anima uses its own implementation (`anima_models.py`, `strategy_anima.py`) derived from Flux but separate. The standard Flux library files are not imported by Anima scripts.
-- `library/strategy_flux.py`
-- `library/flux_models.py`
-- `library/flux_train_utils.py`
-- `library/flux_utils.py`
+## Still referenced — DO NOT DELETE
+Verified to have live inbound references (reference count in parentheses):
 
-### 5. SDXL Specifics
-Although `train_network.py` supports SDXL via `strategy_sd.py`, it does not utilize these specific standalone utility files. They are likely for `sdxl_train.py` or `sdxl_train_network.py` which are not present.
-- `library/strategy_sdxl.py`
-- `library/sdxl_lpw_stable_diffusion.py`
-- `library/sdxl_model_util.py`
-- `library/sdxl_original_control_net.py`
-- `library/sdxl_original_unet.py`
-- `library/sdxl_train_util.py`
+- `sd3_models.py` (17), `sd3_train_utils.py` (7), `sd3_utils.py` (6) — used by Anima/Lumina/Flux paths
+- `strategy_lumina.py` (20), `lumina_models.py` (18), `lumina_train_util.py` (19), `lumina_util.py` (15) — used by `lumina_train*.py`
+- `flux_models.py` (23), `flux_utils.py` (7) — `flux_utils` also pulls in `chroma_models.py`
+- `strategy_sdxl.py` (12), `sdxl_model_util.py` (31), `sdxl_original_unet.py` (33), `sdxl_train_util.py` (28),
+  `sdxl_lpw_stable_diffusion.py` (3), `sdxl_original_control_net.py` (3) — used by `sdxl_train*.py` / `sdxl_gen_img.py`
+- `slicing_vae.py` (1) — used by `sdxl_gen_img.py`
+- `hypernetwork.py` (6), `original_unet.py` (9), `lpw_stable_diffusion.py` (4), `chroma_models.py` (2)
 
-### 6. Miscellaneous / Legacy
-- `library/slicing_vae.py`: No references found.
-- `library/hypernetwork.py`: Used only for Hypernetwork training (not supported/present in this repo).
-- `library/chroma_models.py`: No references found.
-- `library/original_unet.py`: Standard SD1.5 UNet definition (used by older scripts, not Anima).
-- `library/lpw_stable_diffusion.py`: Long Prompt Weighting for SD1.5 (Anima uses Qwen3/T5).
+## Possible future cleanup (dead, but left in place for now)
+- `library/flux_train_utils.py` — the only inbound reference is a *comment* in
+  `lumina_train_util.py` ("mainly copied from flux_train_utils..."); no real
+  import. Safe to delete, kept for now to avoid surprising users.
+- The non-Anima entry scripts (`fine_tune.py`, `sdxl_train*.py`, `sdxl_gen_img.py`,
+  `lumina_*.py`) are out of scope for an "Anima LoRA-only" trainer. Removing them
+  would also free their exclusive `library/` dependencies — but this is a product
+  decision, not a pure cleanup, so it is intentionally left to the maintainer.
 
-## Critical Files (DO NOT DELETE)
-- `library/strategy_sd.py`: Required by `train_network.py` (parent class of `AnimaNetworkTrainer`).
-- `library/train_util.py`: Core utility library.
-- `library/anima_*.py`: Core Anima files.
-- `library/fp8_optimization_utils.py`: Used by `lora_utils.py`.
+## Critical Files (core — never delete)
+- `library/strategy_sd.py` — required by `train_network.py` (parent of `AnimaNetworkTrainer`)
+- `library/train_util.py` — core utility library
+- `library/anima_*.py` — core Anima files
+- `library/fp8_optimization_utils.py` — used by `lora_utils.py`
+
+## How to re-verify
+```bash
+# For a module name, list inbound references across the repo (excluding venv):
+grep -rnE "\bMODULE_NAME\b" --include=*.py . | grep -v "/venv/" | grep -v "library/MODULE_NAME.py:"
+```
+A module is safe to delete only if it has zero references, or its only references
+come from other files that are themselves dead (an isolated dead subgraph).

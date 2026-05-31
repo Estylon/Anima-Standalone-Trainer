@@ -84,38 +84,58 @@ fi
 echo "Node.js detected."
 echo ""
 
-# Detect Python
-if command -v python3 &> /dev/null; then
-    PYTHON_CMD=python3
-elif command -v python &> /dev/null; then
-    PYTHON_CMD=python
-else
-    echo ""
-    echo "[ERROR] Python is not installed!"
-    echo "Please install Python 3.10 or newer."
-    echo ""
-    exit 1
+# ----------------------------------------------------------------------
+# Detect a supported Python interpreter (3.10 - 3.13).
+# torch==2.7.0 has no wheels for Python 3.14+, so we must avoid that even
+# when it is the default "python3". We first probe the explicit versioned
+# binaries (python3.13 ... python3.10), then fall back to python3/python
+# only if they fall inside the supported range.
+# ----------------------------------------------------------------------
+PYTHON_CMD=""
+
+# Helper: returns 0 if "$1 --version" reports a supported 3.10-3.13 interpreter.
+py_is_supported() {
+    local cmd="$1"
+    command -v "$cmd" &> /dev/null || return 1
+    local major minor
+    major=$("$cmd" -c "import sys; print(sys.version_info.major)" 2>/dev/null) || return 1
+    minor=$("$cmd" -c "import sys; print(sys.version_info.minor)" 2>/dev/null) || return 1
+    [ "$major" -eq 3 ] && [ "$minor" -ge 10 ] && [ "$minor" -lt 14 ]
+}
+
+# Prefer explicit versioned interpreters, newest supported first.
+for candidate in python3.13 python3.12 python3.11 python3.10; do
+    if py_is_supported "$candidate"; then
+        PYTHON_CMD="$candidate"
+        break
+    fi
+done
+
+# Fall back to the generic python3/python only if they are in range.
+if [ -z "$PYTHON_CMD" ]; then
+    for candidate in python3 python; do
+        if py_is_supported "$candidate"; then
+            PYTHON_CMD="$candidate"
+            break
+        fi
+    done
 fi
 
-PY_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.major)")
-PY_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.minor)")
-PY_VER="$PY_MAJOR.$PY_MINOR"
-
-if [ "$PY_MAJOR" -ne 3 ] || [ "$PY_MINOR" -lt 10 ]; then
+if [ -z "$PYTHON_CMD" ]; then
     echo ""
-    echo "[ERROR] Python $PY_VER is too old. Minimum required: Python 3.10."
+    if command -v python3 &> /dev/null; then
+        FOUND_VER=$(python3 -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>/dev/null)
+        echo "[ERROR] No supported Python found (3.10 - 3.13 required). Default python3 is $FOUND_VER."
+    else
+        echo "[ERROR] Python is not installed!"
+    fi
     echo "Please install Python 3.10 - 3.13 from: https://www.python.org/downloads/"
-    echo ""
-    exit 1
-fi
-if [ "$PY_MINOR" -ge 14 ]; then
-    echo ""
-    echo "[ERROR] Python $PY_VER is not yet supported. Maximum supported: Python 3.13."
-    echo "Please install Python 3.10 - 3.13 from: https://www.python.org/downloads/"
+    echo "(On Linux you can usually install e.g. python3.12; this script will then pick it up automatically.)"
     echo ""
     exit 1
 fi
 
+PY_VER=$("$PYTHON_CMD" -c "import sys; print('%d.%d' % sys.version_info[:2])")
 echo "Using $PYTHON_CMD ($PY_VER)..."
 
 if [ ! -d "venv" ]; then

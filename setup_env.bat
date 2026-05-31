@@ -65,23 +65,45 @@ if %errorlevel% neq 0 (
 echo Node.js detected.
 echo.
 
+REM ----------------------------------------------------------------------
+REM Find a supported Python interpreter (3.10 - 3.13).
+REM torch==2.7.0 has no wheels for Python 3.14+, so we must avoid it even if
+REM it is the default "python". We prefer the "py" launcher to pick an exact
+REM supported version that is already installed, then fall back to "python".
+REM ----------------------------------------------------------------------
+set "PY_CMD="
+
+where py >nul 2>&1
+if %errorlevel% equ 0 (
+    for %%V in (3.13 3.12 3.11 3.10) do (
+        if not defined PY_CMD (
+            py -%%V --version >nul 2>&1
+            if not errorlevel 1 set "PY_CMD=py -%%V"
+        )
+    )
+)
+
+REM Fallback: no supported version via the py launcher, inspect bare "python".
+REM NOTE: kept at top level (no parentheses) so %PYVER%/%PY_MINOR% expand at
+REM runtime after they are set, not at parse time.
+if defined PY_CMD goto py_ready
+
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
-    echo [ERROR] Python is not installed or not on PATH!
+    echo [ERROR] No supported Python found.
     echo Please install Python 3.10 - 3.13 from: https://www.python.org/downloads/
     echo Make sure to check "Add Python to PATH" during installation.
     echo.
     pause
     exit /b 1
 )
-
 for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
 for /f "tokens=1,2 delims=." %%a in ("%PYVER%") do (
     set PY_MAJOR=%%a
     set PY_MINOR=%%b
 )
-if %PY_MAJOR% neq 3 (
+if not "%PY_MAJOR%"=="3" (
     echo.
     echo [ERROR] Python 3.10 - 3.13 is required. Found Python %PYVER%.
     echo Please install a supported version from: https://www.python.org/downloads/
@@ -100,17 +122,23 @@ if %PY_MINOR% LSS 10 (
 if %PY_MINOR% GEQ 14 (
     echo.
     echo [ERROR] Python %PYVER% is not yet supported. Maximum supported: Python 3.13.
-    echo Please install Python 3.10 - 3.13 from: https://www.python.org/downloads/
+    echo Found Python %PYVER% as the default "python".
+    echo Install Python 3.10 - 3.13 ^(the "py" launcher will then pick it up automatically^),
+    echo or get it from: https://www.python.org/downloads/
     echo.
     pause
     exit /b 1
 )
-echo Python %PYVER% detected.
+set "PY_CMD=python"
+
+:py_ready
+echo Using Python interpreter: %PY_CMD%
+%PY_CMD% --version
 echo.
 
 if not exist venv (
     echo Creating venv...
-    python -m venv venv
+    %PY_CMD% -m venv venv
     if %errorlevel% neq 0 (
         echo.
         echo [ERROR] Failed to create virtual environment.

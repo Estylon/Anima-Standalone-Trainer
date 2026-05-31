@@ -101,8 +101,35 @@ function stripQuotes(p) {
     return p.replace(/^['"]+|['"]+$/g, '');
 }
 
+// Class names passed to --fsdp_transformer_layer_cls_to_wrap are interpolated
+// into a shell command string. Restrict to valid Python identifiers (optionally
+// comma-separated) so a crafted value like "$(rm -rf ~)" can't inject commands.
+function sanitizeClassList(value) {
+    if (typeof value !== 'string') return '';
+    return value.split(',')
+        .map(s => s.trim())
+        .filter(s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s))
+        .join(',');
+}
+
 function getJobPath(name) {
     return path.join(JOBS_DIR, sanitizeName(name));
+}
+
+// Safely resolve a user-supplied relative path inside a trusted base directory.
+// Prevents path-traversal (e.g. "../../global_config.toml") from escaping the
+// job folder. Returns the absolute path if it stays within baseDir, else null.
+function safeJoin(baseDir, relativePath) {
+    if (typeof relativePath !== 'string') return null;
+    // Reject NUL bytes outright (can truncate paths in some syscalls).
+    if (relativePath.indexOf('\0') !== -1) return null;
+    const baseResolved = path.resolve(baseDir);
+    const target = path.resolve(baseResolved, relativePath);
+    // Containment check: target must be baseDir itself or sit below it.
+    const rel = path.relative(baseResolved, target);
+    if (rel === '' ) return target; // baseDir itself
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    return target;
 }
 
 function getGlobalConfig() {
@@ -998,7 +1025,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                     if (ta.fsdp2_auto_wrap_policy === 'SIZE_BASED_WRAP' && ta.fsdp2_min_num_params)
                         accelerateFlags += ` --fsdp_min_num_params ${ta.fsdp2_min_num_params}`;
                     if (ta.fsdp2_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                        const cls = (ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        const cls = sanitizeClassList((ta.fsdp2_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || ''));
                         if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
                     }
                 }
@@ -1018,7 +1045,7 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                 if (ta.fsdp_auto_wrap_policy) {
                     accelerateFlags += ` --fsdp_auto_wrap_policy ${ta.fsdp_auto_wrap_policy}`;
                     if (ta.fsdp_auto_wrap_policy === 'TRANSFORMER_BASED_WRAP') {
-                        const cls = (ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || '');
+                        const cls = sanitizeClassList((ta.fsdp_transformer_layer_cls_to_wrap || '').trim() || (jobArch.fsdp_transformer_cls || ''));
                         if (cls) accelerateFlags += ` --fsdp_transformer_layer_cls_to_wrap "${cls}"`;
                     }
                 }
@@ -1425,6 +1452,17 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
                 broadcastStatus(jobName, 'idle');
             });
 
+            // Without an 'error' listener an emitted 'error' (e.g. spawn ENOENT)
+            // would throw and crash the whole server. Handle it and release the FD.
+            oneShotProc.on('error', (err) => {
+                const msg = `\nERROR: ${err.message}\n`;
+                oneShotLogStream.write(msg);
+                oneShotLogStream.end();
+                broadcastLog(jobName, msg);
+                runningJobs.delete(jobName);
+                broadcastStatus(jobName, 'idle');
+            });
+
             runningJobs.set(jobName, {
                 process: oneShotProc,
                 pid: oneShotProc.pid,
@@ -1445,17 +1483,20 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
 // --- Training Control ---
 
-app.post('/api/jobs/:name/train/start', async (req, res) => {
+// Core training launcher, shared by the manual HTTP endpoint and the queue.
+// Returns { ok:true, pid } on success or { ok:false, status, error } on failure
+// (never throws, so the queue runner can keep going).
+async function startTraining(jobName) {
     try {
-        const jobName = sanitizeName(req.params.name);
+        jobName = sanitizeName(jobName);
         const jobPath = getJobPath(jobName);
         const configPath = path.join(jobPath, 'config.toml');
 
         if (!fs.existsSync(configPath)) {
-            return res.status(404).json({ error: 'Job not found' });
+            return { ok: false, status: 404, error: 'Job not found' };
         }
         if (runningJobs.has(jobName)) {
-            return res.status(400).json({ error: 'Job already running' });
+            return { ok: false, status: 400, error: 'Job already running' };
         }
 
         // Auto-kill persistent gen server to free VRAM
@@ -1550,7 +1591,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         }
 
         const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
-        if (launch.error) return res.status(400).json({ error: launch.error });
+        if (launch.error) return { ok: false, status: 400, error: launch.error };
         const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
 
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
@@ -1617,12 +1658,15 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             appendLog(Buffer.from(msg));
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onTrainingFinished(jobName, code); // advance the queue if active
         });
 
         proc.on('error', (err) => {
             appendLog(Buffer.from(`\nERROR: ${err.message}\n`));
+            logStream.end(); // close the file descriptor even if 'close' never fires (e.g. spawn ENOENT)
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onTrainingFinished(jobName, -1); // treat spawn failure as a non-zero exit
         });
 
         runningJobs.set(jobName, {
@@ -1635,10 +1679,124 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         });
 
         broadcastStatus(jobName, 'running');
-        res.json({ success: true, pid: proc.pid });
+        return { ok: true, pid: proc.pid };
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return { ok: false, status: 500, error: err.message };
     }
+}
+
+// Thin HTTP wrapper around startTraining()
+app.post('/api/jobs/:name/train/start', async (req, res) => {
+    const r = await startTraining(req.params.name);
+    if (r.ok) res.json({ success: true, pid: r.pid });
+    else res.status(r.status || 500).json({ error: r.error });
+});
+
+// ===========================================================================
+// Training queue — run jobs back-to-back on a single GPU.
+//   trainQueue : ordered list of job names waiting to run
+//   queueActive: when true, the next job auto-starts as soon as one finishes
+// ===========================================================================
+let trainQueue = [];
+let queueActive = false;
+
+function anyTrainingRunning() {
+    for (const job of runningJobs.values()) if (job.type === 'training') return true;
+    return false;
+}
+function runningTrainingName() {
+    for (const [name, job] of runningJobs.entries()) if (job.type === 'training') return name;
+    return null;
+}
+function broadcastAll(obj) {
+    const data = JSON.stringify(obj);
+    wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+}
+function queueState() {
+    return { active: queueActive, running: runningTrainingName(), queue: trainQueue.slice() };
+}
+function broadcastQueue() { broadcastAll({ type: 'queue', data: queueState() }); }
+
+// Launch the next queued job if the queue is active and nothing is training.
+async function processQueue() {
+    if (!queueActive || anyTrainingRunning()) return;
+    while (trainQueue.length > 0) {
+        const next = trainQueue.shift();
+        broadcastQueue();
+        const r = await startTraining(next);
+        if (r.ok) {
+            console.log(`[queue] started '${next}' (pid ${r.pid})`);
+            broadcastQueue();
+            return; // one at a time — the close handler advances the rest
+        }
+        console.warn(`[queue] skipping '${next}': ${r.error}`);
+        broadcastAll({ type: 'queue-skip', data: { name: next, error: r.error } });
+    }
+    broadcastQueue(); // queue drained
+}
+
+// Called when a training process ends. Advances the queue only on clean exit;
+// a crash or manual stop pauses the chain so the user can investigate.
+function onTrainingFinished(jobName, code) {
+    if (queueActive) {
+        if (code === 0) {
+            setTimeout(() => { processQueue().catch(e => console.error('[queue]', e)); }, 3000);
+        } else {
+            queueActive = false;
+            console.warn(`[queue] '${jobName}' exited with code ${code}; pausing queue.`);
+        }
+    }
+    broadcastQueue();
+}
+
+app.get('/api/queue', (req, res) => res.json(queueState()));
+
+app.post('/api/queue/add', (req, res) => {
+    const name = sanitizeName((req.body && req.body.name) || '');
+    if (!name) return res.status(400).json({ error: 'Missing job name' });
+    if (!fs.existsSync(path.join(getJobPath(name), 'config.toml')))
+        return res.status(404).json({ error: 'Job not found' });
+    if (runningTrainingName() === name) return res.status(400).json({ error: 'Job already running' });
+    if (!trainQueue.includes(name)) trainQueue.push(name);
+    broadcastQueue();
+    if (queueActive) processQueue().catch(e => console.error('[queue]', e));
+    res.json(queueState());
+});
+
+app.post('/api/queue/remove', (req, res) => {
+    const name = sanitizeName((req.body && req.body.name) || '');
+    trainQueue = trainQueue.filter(n => n !== name);
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/reorder', (req, res) => {
+    const names = Array.isArray(req.body && req.body.names) ? req.body.names.map(sanitizeName) : [];
+    const set = new Set(trainQueue);
+    const reordered = names.filter(n => set.has(n));
+    for (const n of trainQueue) if (!reordered.includes(n)) reordered.push(n); // keep any not listed
+    trainQueue = reordered;
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/clear', (req, res) => {
+    trainQueue = [];
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/start', (req, res) => {
+    queueActive = true;
+    broadcastQueue();
+    processQueue().catch(e => console.error('[queue]', e));
+    res.json(queueState());
+});
+
+app.post('/api/queue/stop', (req, res) => {
+    queueActive = false; // pause auto-advance; does NOT kill the running job
+    broadcastQueue();
+    res.json(queueState());
 });
 
 
@@ -1764,7 +1922,10 @@ app.get('/api/jobs/:name/samples/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0]; // everything after /samples/
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
             res.sendFile(filePath);
         } else {
@@ -1809,7 +1970,10 @@ app.get('/api/jobs/:name/metadata/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0];
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
 
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
             const metadata = extractPngMetadata(filePath);
@@ -1827,7 +1991,10 @@ app.delete('/api/jobs/:name/samples/*', (req, res) => {
     try {
         const jobPath = getJobPath(req.params.name);
         const relativePath = req.params[0];
-        const filePath = path.join(jobPath, relativePath);
+        const filePath = safeJoin(jobPath, relativePath);
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid path' });
+        }
 
         if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
