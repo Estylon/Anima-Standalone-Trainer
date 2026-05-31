@@ -1483,17 +1483,20 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
 // --- Training Control ---
 
-app.post('/api/jobs/:name/train/start', async (req, res) => {
+// Core training launcher, shared by the manual HTTP endpoint and the queue.
+// Returns { ok:true, pid } on success or { ok:false, status, error } on failure
+// (never throws, so the queue runner can keep going).
+async function startTraining(jobName) {
     try {
-        const jobName = sanitizeName(req.params.name);
+        jobName = sanitizeName(jobName);
         const jobPath = getJobPath(jobName);
         const configPath = path.join(jobPath, 'config.toml');
 
         if (!fs.existsSync(configPath)) {
-            return res.status(404).json({ error: 'Job not found' });
+            return { ok: false, status: 404, error: 'Job not found' };
         }
         if (runningJobs.has(jobName)) {
-            return res.status(400).json({ error: 'Job already running' });
+            return { ok: false, status: 400, error: 'Job already running' };
         }
 
         // Auto-kill persistent gen server to free VRAM
@@ -1588,7 +1591,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         }
 
         const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
-        if (launch.error) return res.status(400).json({ error: launch.error });
+        if (launch.error) return { ok: false, status: 400, error: launch.error };
         const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
 
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
@@ -1655,6 +1658,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             appendLog(Buffer.from(msg));
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onTrainingFinished(jobName, code); // advance the queue if active
         });
 
         proc.on('error', (err) => {
@@ -1662,6 +1666,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
             logStream.end(); // close the file descriptor even if 'close' never fires (e.g. spawn ENOENT)
             runningJobs.delete(jobName);
             broadcastStatus(jobName, 'idle');
+            onTrainingFinished(jobName, -1); // treat spawn failure as a non-zero exit
         });
 
         runningJobs.set(jobName, {
@@ -1674,10 +1679,124 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         });
 
         broadcastStatus(jobName, 'running');
-        res.json({ success: true, pid: proc.pid });
+        return { ok: true, pid: proc.pid };
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return { ok: false, status: 500, error: err.message };
     }
+}
+
+// Thin HTTP wrapper around startTraining()
+app.post('/api/jobs/:name/train/start', async (req, res) => {
+    const r = await startTraining(req.params.name);
+    if (r.ok) res.json({ success: true, pid: r.pid });
+    else res.status(r.status || 500).json({ error: r.error });
+});
+
+// ===========================================================================
+// Training queue — run jobs back-to-back on a single GPU.
+//   trainQueue : ordered list of job names waiting to run
+//   queueActive: when true, the next job auto-starts as soon as one finishes
+// ===========================================================================
+let trainQueue = [];
+let queueActive = false;
+
+function anyTrainingRunning() {
+    for (const job of runningJobs.values()) if (job.type === 'training') return true;
+    return false;
+}
+function runningTrainingName() {
+    for (const [name, job] of runningJobs.entries()) if (job.type === 'training') return name;
+    return null;
+}
+function broadcastAll(obj) {
+    const data = JSON.stringify(obj);
+    wss.clients.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+}
+function queueState() {
+    return { active: queueActive, running: runningTrainingName(), queue: trainQueue.slice() };
+}
+function broadcastQueue() { broadcastAll({ type: 'queue', data: queueState() }); }
+
+// Launch the next queued job if the queue is active and nothing is training.
+async function processQueue() {
+    if (!queueActive || anyTrainingRunning()) return;
+    while (trainQueue.length > 0) {
+        const next = trainQueue.shift();
+        broadcastQueue();
+        const r = await startTraining(next);
+        if (r.ok) {
+            console.log(`[queue] started '${next}' (pid ${r.pid})`);
+            broadcastQueue();
+            return; // one at a time — the close handler advances the rest
+        }
+        console.warn(`[queue] skipping '${next}': ${r.error}`);
+        broadcastAll({ type: 'queue-skip', data: { name: next, error: r.error } });
+    }
+    broadcastQueue(); // queue drained
+}
+
+// Called when a training process ends. Advances the queue only on clean exit;
+// a crash or manual stop pauses the chain so the user can investigate.
+function onTrainingFinished(jobName, code) {
+    if (queueActive) {
+        if (code === 0) {
+            setTimeout(() => { processQueue().catch(e => console.error('[queue]', e)); }, 3000);
+        } else {
+            queueActive = false;
+            console.warn(`[queue] '${jobName}' exited with code ${code}; pausing queue.`);
+        }
+    }
+    broadcastQueue();
+}
+
+app.get('/api/queue', (req, res) => res.json(queueState()));
+
+app.post('/api/queue/add', (req, res) => {
+    const name = sanitizeName((req.body && req.body.name) || '');
+    if (!name) return res.status(400).json({ error: 'Missing job name' });
+    if (!fs.existsSync(path.join(getJobPath(name), 'config.toml')))
+        return res.status(404).json({ error: 'Job not found' });
+    if (runningTrainingName() === name) return res.status(400).json({ error: 'Job already running' });
+    if (!trainQueue.includes(name)) trainQueue.push(name);
+    broadcastQueue();
+    if (queueActive) processQueue().catch(e => console.error('[queue]', e));
+    res.json(queueState());
+});
+
+app.post('/api/queue/remove', (req, res) => {
+    const name = sanitizeName((req.body && req.body.name) || '');
+    trainQueue = trainQueue.filter(n => n !== name);
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/reorder', (req, res) => {
+    const names = Array.isArray(req.body && req.body.names) ? req.body.names.map(sanitizeName) : [];
+    const set = new Set(trainQueue);
+    const reordered = names.filter(n => set.has(n));
+    for (const n of trainQueue) if (!reordered.includes(n)) reordered.push(n); // keep any not listed
+    trainQueue = reordered;
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/clear', (req, res) => {
+    trainQueue = [];
+    broadcastQueue();
+    res.json(queueState());
+});
+
+app.post('/api/queue/start', (req, res) => {
+    queueActive = true;
+    broadcastQueue();
+    processQueue().catch(e => console.error('[queue]', e));
+    res.json(queueState());
+});
+
+app.post('/api/queue/stop', (req, res) => {
+    queueActive = false; // pause auto-advance; does NOT kill the running job
+    broadcastQueue();
+    res.json(queueState());
 });
 
 

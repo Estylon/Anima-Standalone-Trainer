@@ -79,6 +79,15 @@ function connectWS() {
         updateHwMonitor(msg.data);
         return;
       }
+      // Queue updates are global too
+      if (msg.type === "queue") {
+        renderQueue(msg.data);
+        return;
+      }
+      if (msg.type === "queue-skip") {
+        showToast(`Queue skipped "${msg.data.name}": ${msg.data.error}`, "danger");
+        return;
+      }
       if (msg.job !== currentJob) return;
       if (msg.type === "log") {
         appendConsole(msg.data);
@@ -96,6 +105,104 @@ function subscribeToJob(jobName) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "subscribe", job: jobName }));
   }
+}
+// ==========================================
+//  Training Queue
+// ==========================================
+let queueData = { active: false, running: null, queue: [] };
+
+async function loadQueue() {
+  try { renderQueue(await api("/api/queue")); } catch (e) { /* ignore */ }
+}
+
+function renderQueue(st) {
+  queueData = st || { active: false, running: null, queue: [] };
+  const list = $("queue-list");
+  const countEl = $("queue-count");
+  const toggle = $("btn-queue-toggle");
+  if (countEl) countEl.textContent = queueData.queue.length;
+  if (toggle) {
+    toggle.classList.toggle("btn-queue-on", queueData.active);
+    toggle.textContent = queueData.active ? "⏸ Pause" : "▶ Start";
+  }
+  if (!list) return;
+  const items = [];
+  if (queueData.running) {
+    items.push(`<div class="queue-item running" title="Currently training">
+      <span class="queue-pos">▶</span>
+      <span class="qname">${queueData.running}</span>
+      <span class="queue-running-tag">running</span>
+    </div>`);
+  }
+  queueData.queue.forEach((name, i) => {
+    items.push(`<div class="queue-item" data-name="${name}">
+      <span class="queue-pos">${i + 1}</span>
+      <span class="qname" title="${name}">${name}</span>
+      <button class="qbtn" data-act="up" title="Move up">▲</button>
+      <button class="qbtn" data-act="down" title="Move down">▼</button>
+      <button class="qbtn" data-act="remove" title="Remove from queue">✕</button>
+    </div>`);
+  });
+  if (items.length === 0) items.push('<div class="queue-empty">Queue is empty</div>');
+  list.innerHTML = items.join("");
+}
+
+async function queueAdd(name) {
+  if (!name) return;
+  try {
+    renderQueue(await api("/api/queue/add", { method: "POST", body: { name } }));
+    showToast(`Added "${name}" to queue`, "success");
+  } catch (e) { showToast(`Queue: ${e.message}`, "danger"); }
+}
+async function queueRemove(name) {
+  try { renderQueue(await api("/api/queue/remove", { method: "POST", body: { name } })); }
+  catch (e) { showToast(`Queue: ${e.message}`, "danger"); }
+}
+async function queueReorder(names) {
+  try { renderQueue(await api("/api/queue/reorder", { method: "POST", body: { names } })); }
+  catch (e) { showToast(`Queue: ${e.message}`, "danger"); }
+}
+function queueMove(name, dir) {
+  const arr = queueData.queue.slice();
+  const i = arr.indexOf(name);
+  if (i < 0) return;
+  const j = dir === "up" ? i - 1 : i + 1;
+  if (j < 0 || j >= arr.length) return;
+  [arr[i], arr[j]] = [arr[j], arr[i]];
+  queueReorder(arr);
+}
+
+function initQueueUI() {
+  const list = $("queue-list");
+  if (list) {
+    list.addEventListener("click", (e) => {
+      const btn = e.target.closest(".qbtn");
+      if (!btn) return;
+      const item = btn.closest(".queue-item");
+      const name = item && item.dataset.name;
+      if (!name) return;
+      const act = btn.dataset.act;
+      if (act === "remove") queueRemove(name);
+      else if (act === "up") queueMove(name, "up");
+      else if (act === "down") queueMove(name, "down");
+    });
+  }
+  const toggle = $("btn-queue-toggle");
+  if (toggle) toggle.addEventListener("click", async () => {
+    try {
+      const ep = queueData.active ? "/api/queue/stop" : "/api/queue/start";
+      renderQueue(await api(ep, { method: "POST" }));
+    } catch (e) { showToast(`Queue: ${e.message}`, "danger"); }
+  });
+  const clear = $("btn-queue-clear");
+  if (clear) clear.addEventListener("click", async () => {
+    if (queueData.queue.length && !confirm("Clear the training queue?")) return;
+    try { renderQueue(await api("/api/queue/clear", { method: "POST" })); }
+    catch (e) { showToast(`Queue: ${e.message}`, "danger"); }
+  });
+  const addBtn = $("btn-queue-add");
+  if (addBtn) addBtn.addEventListener("click", () => { if (currentJob) queueAdd(currentJob); });
+  loadQueue();
 }
 // ==========================================
 //  Hardware Monitor
@@ -256,8 +363,11 @@ async function loadJobs() {
     el.innerHTML = `
             <div class="status-dot"></div>
             <span class="job-name">${job.name}</span>
+            <button class="job-queue-add" title="Add to training queue">➕</button>
         `;
     el.addEventListener("click", () => selectJob(job.name));
+    const qbtn = el.querySelector(".job-queue-add");
+    if (qbtn) qbtn.addEventListener("click", (e) => { e.stopPropagation(); queueAdd(job.name); });
     jobListEl.appendChild(el);
   });
 }
@@ -3381,6 +3491,7 @@ async function init() {
   // 2. Normal Init
   connectWS();
   await loadJobs();
+  initQueueUI();
   // Start status polling
   setInterval(updateGPUActivity, 3000);
   // Watch for config changes
