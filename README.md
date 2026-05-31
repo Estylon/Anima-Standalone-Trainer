@@ -8,6 +8,19 @@ A lightweight, decoupled training environment for circlestone-labs' Anima model,
 <img width="2554" height="1234" alt="image" src="https://github.com/user-attachments/assets/cb5ff930-ce8c-49d6-a77a-3da393fe719d" />
 
 
+## What's different in this fork (Estylon)
+
+This fork is based on [gazingstars123/Anima-Standalone-Trainer](https://github.com/gazingstars123/Anima-Standalone-Trainer) and adds the following on top of upstream:
+
+- **🗒️ Training queue.** Line up many LoRA jobs and let them run back-to-back on a single GPU. A **Queue** panel in the sidebar lets you add jobs (➕ on each job or "➕ Queue" in the editor), reorder them (▲▼), remove them, and Start/Pause the queue. When a job finishes successfully the next one starts automatically; if a job crashes or is stopped, the queue pauses so it doesn't chain failures.
+- **🐍 Smart Python detection in setup.** `setup_env.bat` / `setup_env.sh` now auto-pick an installed, supported interpreter (tries 3.13 → 3.12 → 3.11 → 3.10) instead of relying on the default `python`. This makes setup work even when your default Python is 3.14+ (which has no `torch==2.7.0` wheels yet). The venv is created with the selected interpreter.
+- **🚀 Desktop launcher + configurable port.** `Start_Anima_UI.bat` (repo root) starts the UI and opens the browser with one double-click. The UI now defaults to **port 3001** and accepts a port argument (`Start_Anima_UI.bat 3005`) to avoid clashing with other local apps.
+- **✅ Clear model-path validation.** If the DiT / VAE / Qwen3 path is missing or wrong, training now fails fast with an actionable message (e.g. *"Anima DiT model not found at: …"*) instead of a cryptic loader error.
+- **🔒 Web-server hardening.** Path-traversal protection on the sample/metadata file endpoints, input sanitization for FSDP class names, log-stream leak and crash-safety fixes in the training/generation processes, and `npm audit` vulnerabilities patched.
+- **🧹 Repo cleanup.** Removed unreachable dead modules (the Hunyuan subgraph + unused SD3/Flux strategy shims) and corrected `library_audit.md` to reflect the real dependency graph.
+
+> Everything below is the original upstream documentation and still applies.
+
 ## Prerequisites
 
 - **Python 3.10+** (Python 3.12 recommended)
@@ -49,7 +62,7 @@ pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorc
 
 To start the training server and open the web interface:
 
-**Windows:**
+**Windows:** double-click `Start_Anima_UI.bat` in the repo root (it starts the UI and opens the browser), or run:
 ```cmd
 .\training-ui\start_training_ui_anima.bat
 ```
@@ -58,7 +71,7 @@ To start the training server and open the web interface:
 ```bash
 ./training-ui/start_linux.sh
 ```
-Once launched, open your browser to: `http://localhost:3000`
+Once launched, open your browser to: `http://localhost:3001` (this fork defaults to port 3001; pass another port as an argument, e.g. `Start_Anima_UI.bat 3005`).
 
 ## First Time Setup
 
